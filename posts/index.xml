@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title>Posts on Game Dev Gems</title>
+    <link>https://example.org/posts/</link>
+    <description>Recent content in Posts on Game Dev Gems</description>
+    <generator>Hugo</generator>
+    <language>en-us</language>
+    <lastBuildDate>Tue, 06 Dec 2016 19:39:47 +0800</lastBuildDate>
+    <atom:link href="https://example.org/posts/index.xml" rel="self" type="application/rss+xml" />
+    <item>
+      <title>Rollback Networking in Inversus</title>
+      <link>https://example.org/posts/rollback-networking-in-inversus/</link>
+      <pubDate>Tue, 06 Dec 2016 19:39:47 +0800</pubDate>
+      <guid>https://example.org/posts/rollback-networking-in-inversus/</guid>
+      <description>&lt;h1 id=&#34;rollback-networking-in-inversus&#34;&gt;Rollback Networking in INVERSUS&lt;/h1&gt;&#xA;&lt;p&gt;&lt;a href=&#34;http://www.inversusgame.com/&#34;&gt;INVERSUS&lt;/a&gt; is a fast-paced shared-screen multiplayer game for up to four players. It is the type of game that would traditionally be local-multiplayer, and for a long time I thought latency issues would make it a poor candidate for online. Late in development, I committed to adding online support with the mindset that a “playable but inferior” experience would be better than nothing, but I ended up with something hard to differentiate from its local counterpart! While the subject of networking can cover everything from matchmaking, to choosing a map, and finally playing the game, I’m only going to be discussing the gameplay portion. I want to break down how I made the split-second actions of INVERSUS into a polished online experience.&lt;/p&gt;</description>
+    </item>
+  </channel>
+</rss>

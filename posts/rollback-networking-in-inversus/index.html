@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta
+    name="description"
+    content=""
+  />
+  
+    
+      <title>Rollback Networking in Inversus | Game Dev Gems</title>
+    
+  
+  <link rel="stylesheet" href="/css/reset.css"/>
+  <link rel="stylesheet" href="/css/font.css"/>
+  <link rel="stylesheet" href="/css/smigle.css"/>
+  
+  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+  <link rel="manifest" href="/site.webmanifest">
+  <link rel="mask-icon" href="/safari-pinned-tab.svg" color="#5bbad5">
+  <meta name="msapplication-TileColor" content="#da532c">
+  <meta name="theme-color" content="#ffffff">
+</head>
+
+  <body>
+    <div id="root">
+      <header>
+  <div id="brand">
+    <a class="icon-link" href="https://example.org/">
+      <img
+        class="icon"
+        src="/images/brandIcon.svg"
+      />
+    </a>
+    <div class="text">
+      <a href="https://example.org/"><h1>Game Dev Gems</h1></a>
+      <h3>Thinking in game development</h3>
+    </div>
+  </div>
+  <nav>
+    
+  </nav>
+  <hr />
+</header>
+
+      <div id="content">
+        
+  <main>
+    <article>
+      <h1 class="title">Rollback Networking in Inversus</h1>
+      
+      <div class="post-meta">
+  <strong>
+    <span>Posted on</span>
+    <time>2016-12-06</time>
+    
+    
+  </strong>
+  <span> • 7677 words</span>
+  <span> • 37 minute read</span>
+  
+  
+    <div>
+      <span>Tags:</span>
+      
+        <a href="/tags/invesus">Invesus</a>, 
+        <a href="/tags/networking">Networking</a>, 
+        <a href="/tags/programming">Programming</a>
+    </div>
+  
+</div>
+
+      <div class="content"><h1 id="rollback-networking-in-inversus">Rollback Networking in INVERSUS</h1>
+<p><a href="http://www.inversusgame.com/">INVERSUS</a> is a fast-paced shared-screen multiplayer game for up to four players. It is the type of game that would traditionally be local-multiplayer, and for a long time I thought latency issues would make it a poor candidate for online. Late in development, I committed to adding online support with the mindset that a “playable but inferior” experience would be better than nothing, but I ended up with something hard to differentiate from its local counterpart! While the subject of networking can cover everything from matchmaking, to choosing a map, and finally playing the game, I’m only going to be discussing the gameplay portion. I want to break down how I made the split-second actions of INVERSUS into a polished online experience.</p>
+<h2 id="overview">Overview</h2>
+<p>INVERSUS uses a peer-to-peer rollback system. Before getting into the implementation details, let’s review how rollback networking functions at a high-level.</p>
+<p>Rollback networking an evolution of synchronous networking systems where every player would send input commands to every other player. In these systems, a deterministic game simulation would advance one frame every time it had received commands from each peer. This architecture had numerous benefits, but one huge caveat that drove action games away from it: input latency. In order to allow time for receiving remote player input, the local input wouldn’t be injected into the simulation for a number of frames equal to the transfer speed.</p>
+<p><img src="/images/rollback-networking-in-inversus/1-SynchronousInput.png" alt="SynchronousInput"></p>
+<p>Rollback fixes the latency issue by processing local inputs immediately while predicting the remote inputs. When the <em>actual</em> remote inputs arrive over the network, it checks if anything was mispredicted. If a misprediction was found, time will be rewound to the mispredicted frame and then simulated back to the present using the corrected input values and further predicted values. This rollback and correction process all happens in the span of a single frame such that user only sees a slight pop in the results.</p>
+<p><img src="/images/rollback-networking-in-inversus/2-RollbackInput.png" alt="RollbackInput"></p>
+<p>As network latency increases, visual pops in motion will increase, but they will only be in relation to direct effects of remote player input. For example, the launching of a projectile might skip the first couple frames, but once the projectile is in flight it can be reacted to exactly as if it were in a local multiplayer game.</p>
+<p>Rollback networking is designed to create a near zero latency experience for the local user and fair conflict resolution because every participant’s inputs are respected. When you move, you move right away. If you press a button on a specific frame to counter an attack, you will counter the attack. This architecture also creates a minimal overlap in which game and network code need to consider one another. When adding features to the game, there is almost zero concern about networking. Everything just works and that’s a rather freeing experience for the engineer.</p>
+<p>The main downsides of rollback are that it does not easily support joining in-progress matches, and it does not scale to large player counts. It also doesn’t support a variable frame rate <em>simulation</em>, but I’ll discuss how it can still support variable frame rate <em>rendering</em> later.</p>
+<p>Rollback is perfect for fast, twitchy, frame-accurate games that require responsive input and have short gameplay rounds. It is the standard approach for modern fighting games and should be the standard approach for any quick round-based game with direct player interaction.</p>
+<h2 id="preparing-the-simulation">Preparing the Simulation</h2>
+<p>For any of this to work, your game code needs to support a deterministic simulation and the ability to quickly store and restore the simulation state. You might even already support these features for other reasons. If not, adding support opens up so many useful debug and replay features that it’s honestly worth it regardless of the networking model.</p>
+<h3 id="determinism">Determinism</h3>
+<p>In order to have a deterministic simulation, player input should be the only external influence of how the game will resolve. Given a set of initialization parameters (e.g. level name, time step and a random seed), I can recreate the entire playthrough of a game given just the stream of input commands (button presses, joystick positions). This isn’t actually that difficult to maintain, as long as you follow some general guidelines and architect your game such that gameplay logic isn’t reaching out into global systems. For anyone that hasn’t thought about determinism, I want to give some examples of things to avoid:</p>
+<ul>
+<li>Don’t check any sort of real world time values (local or networked).
+<ul>
+<li>Only compute durations using the simulation time step value.</li>
+<li>Only generate new random seeds based simulation state or initialization parameters.</li>
+</ul>
+</li>
+<li>Avoid polling information from global systems which may not have had determinism in mind
+<ul>
+<li>The more functional you can keep your simulation the safer it will be.</li>
+<li>Supply external information (e.g. input state) to you update rather than having the game code ask for things. This will make it easier to track what external factors need to be synchronized for a deterministic playback.</li>
+</ul>
+</li>
+<li>Don’t let dynamic memory addresses affect logic.
+<ul>
+<li>If you are iterating over a container:
+<ul>
+<li>Don’t sort it by memory pointer values unless the pointer order is deterministic.</li>
+<li>Don’t sort it by hashes of memory pointer values unless the absolute pointer address is deterministic (unlikely).</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>Don’t let uninitialized memory impact logic.
+<ul>
+<li>If you are iterating over a container:
+<ul>
+<li>Don’t sort it by direct memory comparison of structures which might have uninitialized padding. For example in C/C++, using a constructor or bracket based initialization will not clear padding between member variables. You need to memset() to clear all data.</li>
+<li>Don’t sort it by hashes of structures which might have uninitialized padding.</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>Don’t check any sort of local system information:
+<ul>
+<li>Avoid absolute file paths</li>
+<li>Avoid local account ids and usernames</li>
+</ul>
+</li>
+<li>Don’t run different logic based on machine architecture (e.g. optimized math routines)</li>
+<li>Be careful how you merge data that was computed on parallel threads (need a canonical order)</li>
+<li>If you need to support determinism across multiple compile targets, make sure the optimizer will respect your floating-point math.</li>
+</ul>
+<h3 id="state-restoration">State Restoration</h3>
+<p>Rolling back time requires the ability to backup and restore the simulation state such that it <em>perfectly</em> matches the needs of maintaining determinism. Imagine all the data tracked in your game as belonging to two categories: the set that feeds back into the simulation’s next frame (I’ll refer to this as <strong>gamestate</strong>) and the set that does not influence the next frame (I’ll refer to this as <strong>non-gamestate</strong>). Likely examples for game state are object velocities and player health. Likely examples for non-game state are menu locations and loaded textures.</p>
+<p>In case it wasn’t obvious, I should also mention that you need extra memory to store the backed up gamestate. The store/restore operations also need to be performant.</p>
+<h3 id="simulation-performance">Simulation Performance</h3>
+<p>The simulation step needs to be <strong><em>fast</em></strong>. The plan is to execute a rollback and advance the simulation frame-by-frame back to present. This all happens in the span of <em>one</em> render frame. This means that executing a single simulation frame needs to be significantly faster than the input processing rate. The necessary ratio will be dependent on the simulation time step and the amount of network latency you need to support.</p>
+<h2 id="implementation">Implementation</h2>
+<p><img src="/images/rollback-networking-in-inversus/0-Game.png" alt="Inversus"></p>
+<p>With the theoretical understanding of a rollback system behind us, I want to make things more interesting and walk through all the dirty real world scenarios that need handling.</p>
+<h3 id="the-game">The Game</h3>
+<p>We’ll be digging into how all of this functions in INVERSUS so I want to start out by covering the requirements my rollback system is tuned for.</p>
+<ul>
+<li>The game samples input and simulates logic at 60fps. In comparison to a 30fps game, it needs to send twice as much input data over the network.</li>
+<li>Up to four players can be in an online game and they can either all be on their own machine or have multiple players on a single machine (e.g. three players on the local computer and one player on a remote computer)</li>
+<li>On a controller, players move using the left analog stick (any 2D direction at varying speeds) and use the four face buttons to fire in the cardinal directions. Only one direction can be fired in at any one time and holding down a fire button will charge up a shot in the respective direction.</li>
+<li>Being a small indie game, the concurrent players in matchmaking is going to be low and I want to make it as easy as possible to find a game. Thus, I need to support connections between players on opposite sides of the world. INVERSUS can predict and rollback up to 20 frames of input. This supports over 300ms of one-way latency.</li>
+</ul>
+<h3 id="state-segregation">State Segregation</h3>
+<p>The implementation options for storing and restoring gamestate will be heavily influenced by your language and game engine. INVERSUS has a custom built engine in C++ so I have full control of how it works and accesses memory. I have the luxury of keeping systems simple and that was extremely useful here.</p>
+<p>Every bit of data that representing gamestate exists in a single contiguous block of memory. Backing up gamestate is nothing more than a direct memory copy into a buffer of equivalent size. Restoring the state is just a matter of copying it back and stomping over whatever was there prior. For this to be safe, I segregate the game simulation for the rest of the codebase:</p>
+<ul>
+<li>I make sure that nothing in non-gamestate points to any dynamic memory in gamestate. For example, it is fine for external code to hold references to the game logic managers which will persist for the whole round, but it is not fine to reference a projectile which could have its existence reverted and restored at any moment.</li>
+<li>I also make sure that nothing in gamestate points to non-gamestate memory that might be destroyed during a round. For example, because no assets are streamed in or out during gameplay,  I don’t need to worry about texture references from gamestate being unsafe. The texture will never be unloaded while a game is in progress.</li>
+</ul>
+<p>To make this work, I first allocate a 1MB buffer from the application’s memory pool. This is the memory buffer that gets backed up and restored. I wrap the buffer up into a sub-allocator (called the <strong>game allocator</strong>) and use that to allocate all necessary gamestate. The <strong>game scene</strong> is allocated at the head of the buffer. This is the root-level wrapper of everything in gamestate:</p>
+<div class="highlight"><pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;"><code class="language-cpp" data-lang="cpp"><span style="display:flex;"><span><span style="color:#66d9ef">struct</span> <span style="color:#a6e22e">tGameScene</span>
+</span></span><span style="display:flex;"><span>{
+</span></span><span style="display:flex;"><span>    tEntitySimMgr        m_entitySimMgr;
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>    tParticleMgr         m_particleMgr;
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>    tSoundScene          m_soundScene;
+</span></span><span style="display:flex;"><span>    tTieredPoolAllocator m_soundHeap;
+</span></span><span style="display:flex;"><span>    tSizedPoolAllocator  m_soundPools[<span style="color:#ae81ff">4</span>];
+</span></span><span style="display:flex;"><span>};
+</span></span></code></pre></div><p>As you can see, the game scene is built from three parts: entities, particles and sounds. Each part is initialized with the game allocator and thus only knows about the 1MB buffer when making its own allocations.</p>
+<p><strong>Entity Data:</strong> The entity simulation manager is a wrapper of all memory pools for allocating game objects. This is primarily things like projectiles, player ships, pickups and the game board.</p>
+<p><strong>Particle Data:</strong> The particle manager tracks visual effects such as explosions and debris that bounces around the level. The particles only serve an aesthetic purpose and have no influence on the actual gameplay logic so I could have kept them out of gamestate, but doing so would have created more problems to solve.</p>
+<p>For example, imagine a scenario where a ship exploded on frame 100 and the simulation is currently on frame 103. If the networking system decides to rollback to frame 98 and subsequently re-execute the explosion on frame 100, the non-gamestate particle manager would have two explosions running. This issue could be mitigated by trying to ID the two explosions and check if they are logistically the same. You could use this information to prevent duplication and also detect cases requiring early termination. For INVERSUS, I decided to just keep the particle logic in gamestate which removed any determinism concerns when I wanted to program very custom particle logic.</p>
+<p><strong>Sound Data:</strong> The sound scene tracks all of the active sounds being mixed together that are tightly coupled to gameplay. This is not the sound asset data, but just the runtime data like volumes and cursor times. The two sound related allocators are used by the sound scene to manage dynamic memory. Sounds that are not tightly coupled to gameplay are tracked by a separate sound scene in non-gamestate memory. I’ll cover this segregation of audio in more detail later.</p>
+<p>With regards to how much <em>actually</em> needs storing for an accurate recreation of gamestate, there is likely a ton of wasted data in this 1MB buffer, but I find the simplicity well worth it. The memory copy for backing up is very stable. Within gamestate, I can add things, remove things, reorder things and it never causes an issue.</p>
+<h3 id="debug-state">Debug State</h3>
+<p>In a release build of the game, everything worked great as described. In a debug build there was an additional kink I needed to deal with. I have a memory inspection system that lets me view all the different memory pools in the game. It shows high watermarks, checks for resource leaks, etc. All the allocators — even the ones in gamestate — register into this system and get tracked. This creates an issue when an old state is restored because all of the debug allocation data is now wrong.</p>
+<p>To fix this, I needed to add some functionality to my memory system that could serialize/deserialize all of the gamestate allocation data to a buffer. The memory inspection is tracked as a tree of allocators and sub allocators so I can use the game allocator as the root element to serialize from.</p>
+<h3 id="deterministic-input">Deterministic Input</h3>
+<p>Input is fed to the game simulation separately from other consumers like the UI. Before the input data is supplied to the game, it gets stripped down and quantized into the same set of data sent across the network. This ensures that everything stays deterministic with how the local machine and the remote machines simulate. It also ensures that local games feel exactly the same as online games because both function at the same level of input precision.</p>
+<p>Input for each player is tracked in the following structure. The input history used for rollback correction is tracked as arrays of these structures. When stored in memory there are some bits wasted in the fire direction and padding, but you’ll see that it’s far more optimal when sent over the network.</p>
+<div class="highlight"><pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;"><code class="language-cpp" data-lang="cpp"><span style="display:flex;"><span><span style="color:#66d9ef">enum</span> <span style="color:#a6e22e">tShipFireDir</span>
+</span></span><span style="display:flex;"><span>{
+</span></span><span style="display:flex;"><span>    ShipFireDir_None,
+</span></span><span style="display:flex;"><span>    ShipFireDir_Left,
+</span></span><span style="display:flex;"><span>    ShipFireDir_Right,
+</span></span><span style="display:flex;"><span>    ShipFireDir_Up,
+</span></span><span style="display:flex;"><span>    ShipFireDir_Down,
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>    ShipFireDir_MAX,
+</span></span><span style="display:flex;"><span>};
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span><span style="color:#66d9ef">struct</span> <span style="color:#a6e22e">tPlayerInput</span>
+</span></span><span style="display:flex;"><span>{
+</span></span><span style="display:flex;"><span>    tU8 m_fireDir;   <span style="color:#75715e">// set to tShipFireDir enumeration
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>    tU8 m_thrustAng; <span style="color:#75715e">// quantized representation of angle [0,255] -&gt; [0, 2pi-2pi/256]
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>    tU8 m_thrustMag; <span style="color:#75715e">// quantized representation of magnitude [0,255] -&gt; [0,1]
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>};
+</span></span></code></pre></div><h3 id="input-prediction">Input Prediction</h3>
+<p>While waiting for new input to arrive from the peer machines, the game keeps simulating forward with the latest input for local players. While waiting for remote player input to arrive, it is predicted with the hope of reducing visual pops during rollback correction. For INVERSUS, the prediction just repeats the most recent input state for each player. This is a shippable solution and is the optimal one for fire input, but I suspect that I could do a better job with movement input. Generating a spline from the recent history of thrust vectors would likely help with accelerations, but it got cut for time.</p>
+<h3 id="input-communication">Input Communication</h3>
+<p>INVERSUS runs on a UDP connection so the issue of packet loss needs to be considered when transferring input messages. The input packets also notify peers about the next frame the sender needs to receive. This acknowledgement of past input being received sets a baseline for sending more input. By always sending the full set of input data between the baseline and the current frame, lost packets will not cause issue. This is slightly overkill (especially for long distance connections), but it seemed far simpler to test than sending only a few redundant frames and having a separate logic path to handle major packet loss scenarios.</p>
+<p>Because the game <em>could</em> send up to 20 frames of data under high latency conditions, the data needs to be compressed to reduce bandwidth. This is primarily handled through delta compression. An input packet looks something like this:</p>
+<pre tabindex="0"><code>24 bits: Base Frame (the frame number other frames in this message are relative to)
+ 8 bits: The next remote frame we want to receive from the peer (relative to the base frame) 
+ 8 bits: The first frame we are sending (relative to the base frame)
+ 8 bits: One past the last frame we are sending (relative to the base frame)
+
+For each frame:
+  For each local player:
+    If the fire direction changed:
+      1 bit: one
+      3 bits: fire direction
+    Else:
+      1 bit: zero
+
+    If the move angle changed:
+      1 bit: one
+      8 bits: thrust angle
+    Else:
+      1 bit: zero
+
+    If the move magnitude changed:
+      1 bit: one
+      8 bits: thrust magnitude
+    Else:
+      1 bit: zero
+</code></pre><p>The frame numbers could be compressed more (they don’t need 8 bits and one of them is always zero), but it works well enough.</p>
+<p>Messages are sent at 60hz so there is also a throttling system when we haven’t received communication from a peer in a while. This helps prevent flooding anyone with messages if they have an unexpected networking hiccup or can’t keep up with the data (maybe extensive debug logging is slowing down their frame rate). The throttling also tells us to calm down if we have a networking hiccup and stop hearing from everyone. This was very useful during development because opening up one of the peers in the debugger will put the brakes on everyone else. The actual implementation just drops a peer’s send message rate to 4 times per second once it stops hearing from them in over 1 second.</p>
+<h3 id="rolling-state-buffers">Rolling State Buffers</h3>
+<p>When mispredicted input is detected, the game needs to rollback to the first out of sync frame. Depending on your game and needs, this could work in a number of different ways. For example, you could just create a ring buffer with backups of every frame up until the supported latency limit. The main issue with this approach is that if you need to resimulate a bunch of frames due to an old misprediction, you would also need to re-backup all the corrected intermediate frames in the process.</p>
+<p>INVERSUS only tracks two backups of gamestate and writes over the oldest backup every time the newest one gets over 20 frames old. When an input correction is needed, I restore to the closest prior backup and simulate forward to the corrected frame. While simulating forward, I check for the most recent frame in which I have received inputs from all peers. I will never have to restore prior to this position again and update the oldest backup accordingly. This reduces the number of simulated frames I need to compute on future corrections.</p>
+<p>It’s worth pointing out that this implementation creates cpu spikes when there is a large misprediction. Normally I’d avoid this style of architecture by running the worst case scenario each frame and having a predictable experience to optimize for. For example, an alternate and simpler system would just store one backup that was 20 frames old. Every frame it always restores to said backup, advances the backup by one frame and simulates the remaining 19 frames forward to the present. So why didn’t I do this? I decided to make INVERSUS networked <em>very</em> late in the dev process and was trying to make safe bets at each turn. Given that I was supporting older PCs (which were hard to thoroughly test as one person), I was concerned about performance in the common case (especially for late-game arcade matches with tons of pathing enemies and thousands of particles testing collision). I’m sure it could run fast enough for any machine with some devoted optimization, but I decided it was the more risky path at the time. In retrospect, I think that was the likely wrong call and would suggest trying the simpler implementation if possible.</p>
+<h3 id="frame-advantage">Frame Advantage</h3>
+<p>It’s possible that one client takes longer to execute a frame than the other clients. This might be due to a slower PC or due to needing to correct an older input misprediction or due to the operating system doing something the game has no control over. If this happens and the game fails to meet its 60hz frame rate, it will be one (or more) ticks behind its peers. This creates a competitive advantage.</p>
+<p>Let’s call the slow machine ‘Sarah’ and the fast machine ‘Fred’. If Fred is running a few frames ahead of Sarah, he will end up using input prediction to cover up the delta. He won’t see Sarah’s true input until that delay passes. From Sarah’s perspective, all of Fred’s inputs are arriving immediately because Fred processed the current frame earlier in real-world time. As a result, she can react to Fred’s inputs before Fred can react to Sarah’s inputs. Sarah is at an advantage and the game needs to correct for it.</p>
+<p>Based on the input message data, we know both the next frame being processed remotely (one past the final input frame encoded) and the next frame they are requesting from us. Every time an input message is received, we can compute how many frames of our input are being predicted on the remote machine:</p>
+<div class="highlight"><pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;"><code class="language-cpp" data-lang="cpp"><span style="display:flex;"><span>remoteFrameLag <span style="color:#f92672">=</span> nextRemoteFrameToReceive <span style="color:#f92672">-</span> nextLocalFrameRequestedByPeer;
+</span></span></code></pre></div><p>Every time we send an input message, we can compute how many frames of remote input are being predicted on our machine:</p>
+<div class="highlight"><pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;"><code class="language-cpp" data-lang="cpp"><span style="display:flex;"><span>localFrameLag <span style="color:#f92672">=</span> nextLocalFrameToSimulate <span style="color:#f92672">-</span> nextRemoteFrameToReceive;
+</span></span></code></pre></div><p>In a perfect world, these two numbers are equal and there is no frame advantage. When they are not equal, we can tell the faster machine (the machine at a competitive disadvantage) to intentionally stall and reduce the gap. The end goal is that if we drop a frame, everyone else will make sure they also drop a frame in response.</p>
+<p>The input frame advantage that a peer has over us is the difference between the remote lag and the local lag. For example, if the peer is viewing us with 1 frame of lag and we are viewing the peer with 5 frames of lag, the peer has 4 frame advantage over us. If faster machine intentionally stalls for 1 frame, it will to reduce it’s input lag by 1 and increase the slow machine’s input lag by 1. In other words, adjusting the simulation frame advantage by 1 adjusts the input frame advantage by 2.</p>
+<p><img src="/images/rollback-networking-in-inversus/3-FrameAdvantage.png" alt="FrameAdvantage"></p>
+<p>In order to decide how much of an advantage needs to be corrected, all remote players need to be considered. INVERSUS computes the advantages each remote player has over the local machine and uses the largest one.</p>
+<div class="highlight"><pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;"><code class="language-cpp" data-lang="cpp"><span style="display:flex;"><span>bestInputFrameAdvantage <span style="color:#f92672">=</span> <span style="color:#ae81ff">0</span>
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span><span style="color:#66d9ef">for</span> (each player)
+</span></span><span style="display:flex;"><span>{
+</span></span><span style="display:flex;"><span>    <span style="color:#66d9ef">if</span> (player is remote)
+</span></span><span style="display:flex;"><span>    {
+</span></span><span style="display:flex;"><span>        inputFrameAdvantage <span style="color:#f92672">=</span> localFrameLag <span style="color:#f92672">-</span> remoteFrameLag; <span style="color:#75715e">// advantage they have over us
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>        bestInputFrameAdvantage <span style="color:#f92672">=</span> Max(bestInputFrameAdvantage, inputFrameAdvantage);
+</span></span><span style="display:flex;"><span>    }
+</span></span><span style="display:flex;"><span>}
+</span></span></code></pre></div><h4 id="advantage-smoothing">Advantage Smoothing</h4>
+<p>Network traffic fluctuates and thus the frame advantage computations also fluctuate. If we reacted to advantages immediately, the whole game would run slower as it aggressively drops frames that might have been unnecessary in the long run. To combat this, I only process an averaged advantage every 100 frames (a cadence which was empirically chosen). The remote and local lag numbers are accumulated with each network message over the 100 frame period. On the 100th frame, the sums are then divided by the appropriate counts and the mean values are subtracted to compute a floating-point frame advantage.</p>
+<h4 id="sub-frame-advantages">Sub-Frame Advantages</h4>
+<p>Recall that reducing the input frame advantage on one side increases it on the other. This means that to correct an input frame advantage of 2, the faster/disadvantaged machine needs to wait 1 simulation frame. One local frame of lag is added, one remote frame of lag is reduced, and the new input frame advantage is zero. To correct an input frame advantage of 1, the game would need to wait 0.5 simulation frames, but that isn’t possible if you want to sync to a 60hz refresh rate. Thus, the game never corrects for single input frame advantages.</p>
+<p>Given that our advantages are averaged to be a floating-point value, we can still improve on input advantages between 1.0 and 2.0. For example, if we computed a mean local lag of 2.6 frames and a mean remote lag of 1.0 frames, the remote machine has a 1.6 frame advantage over us. By locally stalling 1 frame, we switch to a local lag of 1.6 frames and a remote lag of 2.0 frames. This puts us at a 0.4 frame advantage over the remote machine. While the advantage has shifted sides, its magnitude has also decreased and we end up with a more fair game.</p>
+<p>It might seem weird that we can operate in partial frames like this. What is happening in the real world? This is the result of the each machine’s tick rate being phase shifted. Everyone is updating 60 times per second, but there is no reason my updates need to happen in alignment with your updates. They are likely shifted a few milliseconds ahead or behind. The noise of network traffic is letting use detect this offset over 100 frames and we are making sure the two games are synchronizing on whichever side is closer.</p>
+<p>Here’s the code in practice. You’ll note that I don’t bother with simulation advantages below 0.75 because it proved less stable given that I am only averaging 100 frames of noisy data. Adding this 0.25 buffer helped keep things smooth, while still allowing for reasonable sub-frame advantage correction.</p>
+<div class="highlight"><pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;"><code class="language-cpp" data-lang="cpp"><span style="display:flex;"><span><span style="color:#75715e">// Compute the advantage in simualtion frames. Adjusting the simulation by one frame
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e">// adjusts the input advantage by 2 frames (one on each side).
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>tF32 simulationFrameAdvantage <span style="color:#f92672">=</span> <span style="color:#ae81ff">0.5f</span> <span style="color:#f92672">*</span> bestInputFrameAdvantage;
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span><span style="color:#75715e">// We can theoretically reduce simulation advantages above 0.5 frames, but we only
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e">// test against 0.75 for stability given the inaccuracy of our measurements.
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>tU32 newStallFrames <span style="color:#f92672">=</span> <span style="color:#ae81ff">0</span>;
+</span></span><span style="display:flex;"><span><span style="color:#66d9ef">if</span> (simulationFrameAdvantage <span style="color:#f92672">&gt;=</span> <span style="color:#ae81ff">0.75f</span>)
+</span></span><span style="display:flex;"><span>{
+</span></span><span style="display:flex;"><span>    newStallFrames <span style="color:#f92672">+=</span> Max(<span style="color:#ae81ff">1u</span>, (tU32)(simulationFrameAdvantage <span style="color:#f92672">+</span> <span style="color:#ae81ff">0.5f</span>));
+</span></span><span style="display:flex;"><span>}
+</span></span></code></pre></div><h4 id="stall-application">Stall Application</h4>
+<p>Now that we’ve got the number of frames to stall, we can just wait them out right? Not quite. In order to hide the process, the individual stalled frames are queued up and distributed over time. As the number of frames that need to be stalled increases, the cadence also increases. This helps keep the frame drops unnoticed in the common case, while still remaining responsive when large corrections are needed.</p>
+<p>I adjust the cadence every frame with the following empirically derived logic. Because the cadence is constantly changing, it spreads out as more stalled frames are processed. The code could easily be made more compact with a simple formula, but having it set up like this made it easy for me try out different settings (they weren’t always so linear).</p>
+<div class="highlight"><pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;"><code class="language-cpp" data-lang="cpp"><span style="display:flex;"><span><span style="color:#75715e">// Compute how often to stall the game based on the
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e">// number of frames that need to be skipped
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>tU32 distributeFramePeriod <span style="color:#f92672">=</span> <span style="color:#ae81ff">1</span>;
+</span></span><span style="display:flex;"><span><span style="color:#66d9ef">switch</span> (m_stallFrameQueue)
+</span></span><span style="display:flex;"><span>{
+</span></span><span style="display:flex;"><span>    <span style="color:#66d9ef">case</span> <span style="color:#ae81ff">1</span><span style="color:#f92672">:</span> distributeFramePeriod <span style="color:#f92672">=</span> <span style="color:#ae81ff">10</span>; <span style="color:#66d9ef">break</span>;
+</span></span><span style="display:flex;"><span>    <span style="color:#66d9ef">case</span> <span style="color:#ae81ff">2</span><span style="color:#f92672">:</span> distributeFramePeriod <span style="color:#f92672">=</span> <span style="color:#ae81ff">9</span>; <span style="color:#66d9ef">break</span>;
+</span></span><span style="display:flex;"><span>    <span style="color:#66d9ef">case</span> <span style="color:#ae81ff">3</span><span style="color:#f92672">:</span> distributeFramePeriod <span style="color:#f92672">=</span> <span style="color:#ae81ff">8</span>; <span style="color:#66d9ef">break</span>;
+</span></span><span style="display:flex;"><span>    <span style="color:#66d9ef">case</span> <span style="color:#ae81ff">4</span><span style="color:#f92672">:</span> distributeFramePeriod <span style="color:#f92672">=</span> <span style="color:#ae81ff">7</span>; <span style="color:#66d9ef">break</span>;
+</span></span><span style="display:flex;"><span>    <span style="color:#66d9ef">case</span> <span style="color:#ae81ff">5</span><span style="color:#f92672">:</span> distributeFramePeriod <span style="color:#f92672">=</span> <span style="color:#ae81ff">6</span>; <span style="color:#66d9ef">break</span>;
+</span></span><span style="display:flex;"><span>    <span style="color:#66d9ef">case</span> <span style="color:#ae81ff">6</span><span style="color:#f92672">:</span> distributeFramePeriod <span style="color:#f92672">=</span> <span style="color:#ae81ff">5</span>; <span style="color:#66d9ef">break</span>;
+</span></span><span style="display:flex;"><span>    <span style="color:#66d9ef">case</span> <span style="color:#ae81ff">7</span><span style="color:#f92672">:</span> distributeFramePeriod <span style="color:#f92672">=</span> <span style="color:#ae81ff">4</span>; <span style="color:#66d9ef">break</span>;
+</span></span><span style="display:flex;"><span>    <span style="color:#66d9ef">case</span> <span style="color:#ae81ff">8</span><span style="color:#f92672">:</span> distributeFramePeriod <span style="color:#f92672">=</span> <span style="color:#ae81ff">3</span>; <span style="color:#66d9ef">break</span>;
+</span></span><span style="display:flex;"><span>    <span style="color:#66d9ef">case</span> <span style="color:#ae81ff">9</span><span style="color:#f92672">:</span> distributeFramePeriod <span style="color:#f92672">=</span> <span style="color:#ae81ff">2</span>; <span style="color:#66d9ef">break</span>;
+</span></span><span style="display:flex;"><span>    <span style="color:#66d9ef">default</span><span style="color:#f92672">:</span> distributeFramePeriod <span style="color:#f92672">=</span> <span style="color:#ae81ff">1</span>; <span style="color:#66d9ef">break</span>;
+</span></span><span style="display:flex;"><span>}
+</span></span></code></pre></div><h4 id="startup-advantage">Startup Advantage</h4>
+<p>Frame advantages are also likely to happen at the start of a game. Assuming one machine (the host) had to decide to start the game and then tell the other machines to start, the host will start ahead of everyone else. Left as is, every new game would begin with a frame advantage and the host would need to stall to correct it.</p>
+<p>To minimize this issue, INVERSUS communicates the full mesh of ping times between each member before a game. Once every peer has notified us that it is ready to start the next game, we can use the ping information to estimate how long it would take for each member to get notified that each other member is ready (i.e. how long did is take our peers to reach the same bit of code we are currently running).</p>
+<div class="highlight"><pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;"><code class="language-cpp" data-lang="cpp"><span style="display:flex;"><span><span style="color:#75715e">// compute the estimated start game durations for each member
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>tS32 memberDelays[ RJ_ARRAY_LENGTH(m_members) ] <span style="color:#f92672">=</span> {};
+</span></span><span style="display:flex;"><span><span style="color:#66d9ef">for</span> (tU32 targetIdx <span style="color:#f92672">=</span> <span style="color:#ae81ff">0</span>; targetIdx <span style="color:#f92672">&lt;</span> m_activeGameSettings.m_memberCount; <span style="color:#f92672">++</span>targetIdx)
+</span></span><span style="display:flex;"><span>{
+</span></span><span style="display:flex;"><span>    <span style="color:#66d9ef">for</span> (tU32 peerIdx <span style="color:#f92672">=</span> <span style="color:#ae81ff">0</span>; peerIdx <span style="color:#f92672">&lt;</span> m_activeGameSettings.m_memberCount; <span style="color:#f92672">++</span>peerIdx)
+</span></span><span style="display:flex;"><span>    {
+</span></span><span style="display:flex;"><span>        <span style="color:#66d9ef">if</span> (peerIdx <span style="color:#f92672">!=</span> targetIdx)
+</span></span><span style="display:flex;"><span>        {
+</span></span><span style="display:flex;"><span>            tGameMember<span style="color:#f92672">*</span> pPeerMember <span style="color:#f92672">=</span> m_members<span style="color:#f92672">+</span>peerIdx;
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>            <span style="color:#75715e">// time for message to be sent from owner to peer and then to target
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>            <span style="color:#75715e">// note: we divide by 2 because the ping value is a round trip time
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>            tS32 delayThroughPeer <span style="color:#f92672">=</span> (pOwnerMember<span style="color:#f92672">-&gt;</span>m_peerPings[peerIdx] <span style="color:#f92672">+</span> pPeerMember<span style="color:#f92672">-&gt;</span>m_peerPings[targetIdx])<span style="color:#f92672">/</span><span style="color:#ae81ff">2</span>;
+</span></span><span style="display:flex;"><span>            memberDelays[targetIdx] <span style="color:#f92672">=</span> Max(memberDelays[targetIdx], delayThroughPeer);
+</span></span><span style="display:flex;"><span>        }
+</span></span><span style="display:flex;"><span>    }
+</span></span><span style="display:flex;"><span>}
+</span></span></code></pre></div><p>By checking how much longer the most delayed peer will take to start the game than it took the local machine, we can determining how much extra time to locally wait before starting gameplay.</p>
+<div class="highlight"><pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;"><code class="language-cpp" data-lang="cpp"><span style="display:flex;"><span><span style="color:#75715e">// wait for the delta of time we expect it to take for all peers to start the game after us
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>tS32 startGameDelay <span style="color:#f92672">=</span> <span style="color:#ae81ff">0</span>;
+</span></span><span style="display:flex;"><span><span style="color:#66d9ef">for</span> (tU32 i <span style="color:#f92672">=</span> <span style="color:#ae81ff">0</span>; i <span style="color:#f92672">&lt;</span> m_activeGameSettings.m_memberCount; <span style="color:#f92672">++</span>i)
+</span></span><span style="display:flex;"><span>{
+</span></span><span style="display:flex;"><span>    startGameDelay <span style="color:#f92672">=</span> Max( startGameDelay, memberDelays[i] <span style="color:#f92672">-</span> memberDelays[localMemberIdx] );
+</span></span><span style="display:flex;"><span>}
+</span></span></code></pre></div><p>This could be improved further by having a short period before gameplay where input was being networked and any remaining frame advantages had time to smooth out, but I never got around to that. The estimation alone worked well enough and it is rare that I notice any immediate advantage corrections upon starting a game.</p>
+<h3 id="dynamic-input-latency">Dynamic Input Latency</h3>
+<p>There is one more trick we can use to improve the experience of high latency connections. Recall that as the latency increases, the remote players start to exhibit symptoms of rollback correction. Bullets will spawn slightly into their trajectory and fast turns will appear to pop. As the symptoms get more severe, they can be worth mitigating at the cost of sluggish local controls.</p>
+<p>Let’s say we buffered up a few frames of local input before injecting them into the simulation, but we still networked the input immediately. From the viewpoint of our peers, nothing has changed, but locally there are two changes: on the downside, the game feels more sluggish, but on the upside, we have reduced the perceived network latency. If it hides the full network transmission period, the online game will look exactly as smooth as a local game.</p>
+<p><img src="/images/rollback-networking-in-inversus/4-RollbackWithLatencyInput.png" alt="RollbackWithLatencyInput"></p>
+<p>For this to be a viable feature, the game needs to already have an absolute minimal input latency to build on top of. The order of logic in an INVERSUS frame is specifically chosen to meet this goal. It also ensures that the graphics driver is unable to internally buffer commands creating more latency (which is an absolute ridiculous feature of PC graphics drivers).</p>
+<p>We could present this “local frame delay” as an option for the user to tune, but I try to avoid player-facing-options unless they are mitigating limitations of the OS, or assisting users with physical disabilities. Anything else often indicates a lack of vision in the intended experience or a failure to automate a solution. Rather than exposing what would be a highly technical setting, I periodically recompute a value that creates a balanced experience of controls and visual fidelity.</p>
+<p>With a fast connection, I remove all local input lag and allow a couple frames of remote lag. As the connection worsens, I limit how fast the remote lag can increase by adding frames of local lag. I found anything past 4 frames of local input lag to be too unpleasant so I stop there. Even 4 is pushing it, but I only ever go so high for very long distance connections.</p>
+<p>My empirically tuned state machine works as follows. Given the current local lag setting and the worst remote lag of our peers (averaged every 100 frames), it will return the new setting.</p>
+<div class="highlight"><pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;"><code class="language-cpp" data-lang="cpp"><span style="display:flex;"><span><span style="color:#75715e">//******************************************************************************
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e">// Compute the new input lag to use based on the current lag. This is
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e">// implemented as state machine to prevent quick toggling back and forth.
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e">//******************************************************************************
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span><span style="color:#66d9ef">static</span> tU32 <span style="color:#a6e22e">CalcInputLagFrames</span>(tU32 curInputLagFrames, tF32 worstPeerFrameLag)
+</span></span><span style="display:flex;"><span>{
+</span></span><span style="display:flex;"><span>    tU32 newInputLagFrames <span style="color:#f92672">=</span> curInputLagFrames;
+</span></span><span style="display:flex;"><span>    <span style="color:#66d9ef">if</span> (<span style="color:#f92672">!</span>RJ_GET_DEBUG_BOOL(DisableNetInputLag))
+</span></span><span style="display:flex;"><span>    {
+</span></span><span style="display:flex;"><span>        <span style="color:#75715e">// increase lag
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>        <span style="color:#66d9ef">if</span> (curInputLagFrames <span style="color:#f92672">&lt;=</span> <span style="color:#ae81ff">0</span> <span style="color:#f92672">&amp;&amp;</span> worstPeerFrameLag <span style="color:#f92672">&gt;=</span> <span style="color:#ae81ff">2.0f</span>)
+</span></span><span style="display:flex;"><span>            newInputLagFrames <span style="color:#f92672">=</span> <span style="color:#ae81ff">1</span>;
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>        <span style="color:#66d9ef">if</span> (curInputLagFrames <span style="color:#f92672">&lt;=</span> <span style="color:#ae81ff">1</span> <span style="color:#f92672">&amp;&amp;</span> worstPeerFrameLag <span style="color:#f92672">&gt;=</span> <span style="color:#ae81ff">3.0f</span>)
+</span></span><span style="display:flex;"><span>            newInputLagFrames <span style="color:#f92672">=</span> <span style="color:#ae81ff">2</span>;
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>        <span style="color:#66d9ef">if</span> (curInputLagFrames <span style="color:#f92672">&lt;=</span> <span style="color:#ae81ff">2</span> <span style="color:#f92672">&amp;&amp;</span> worstPeerFrameLag <span style="color:#f92672">&gt;=</span> <span style="color:#ae81ff">6.0f</span>)
+</span></span><span style="display:flex;"><span>            newInputLagFrames <span style="color:#f92672">=</span> <span style="color:#ae81ff">3</span>;
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>        <span style="color:#66d9ef">if</span> (curInputLagFrames <span style="color:#f92672">&lt;=</span> <span style="color:#ae81ff">3</span> <span style="color:#f92672">&amp;&amp;</span> worstPeerFrameLag <span style="color:#f92672">&gt;=</span> <span style="color:#ae81ff">8.0f</span>)
+</span></span><span style="display:flex;"><span>            newInputLagFrames <span style="color:#f92672">=</span> <span style="color:#ae81ff">4</span>;
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>        <span style="color:#75715e">// reduce lag
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>        <span style="color:#66d9ef">if</span> (curInputLagFrames <span style="color:#f92672">&gt;=</span> <span style="color:#ae81ff">4</span> <span style="color:#f92672">&amp;&amp;</span> worstPeerFrameLag <span style="color:#f92672">&lt;=</span> <span style="color:#ae81ff">7.0f</span>)
+</span></span><span style="display:flex;"><span>            newInputLagFrames <span style="color:#f92672">=</span> <span style="color:#ae81ff">3</span>;
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>        <span style="color:#66d9ef">if</span> (curInputLagFrames <span style="color:#f92672">&gt;=</span> <span style="color:#ae81ff">3</span> <span style="color:#f92672">&amp;&amp;</span> worstPeerFrameLag <span style="color:#f92672">&lt;=</span> <span style="color:#ae81ff">5.0f</span>)
+</span></span><span style="display:flex;"><span>            newInputLagFrames <span style="color:#f92672">=</span> <span style="color:#ae81ff">2</span>;
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>        <span style="color:#66d9ef">if</span> (curInputLagFrames <span style="color:#f92672">&gt;=</span> <span style="color:#ae81ff">2</span> <span style="color:#f92672">&amp;&amp;</span> worstPeerFrameLag <span style="color:#f92672">&lt;=</span> <span style="color:#ae81ff">2.0f</span>)
+</span></span><span style="display:flex;"><span>            newInputLagFrames <span style="color:#f92672">=</span> <span style="color:#ae81ff">1</span>;
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>        <span style="color:#66d9ef">if</span> (curInputLagFrames <span style="color:#f92672">&gt;=</span> <span style="color:#ae81ff">1</span> <span style="color:#f92672">&amp;&amp;</span> worstPeerFrameLag <span style="color:#f92672">&lt;=</span> <span style="color:#ae81ff">1.0f</span>)
+</span></span><span style="display:flex;"><span>            newInputLagFrames <span style="color:#f92672">=</span> <span style="color:#ae81ff">0</span>;
+</span></span><span style="display:flex;"><span>    }
+</span></span><span style="display:flex;"><span>    <span style="color:#66d9ef">else</span>
+</span></span><span style="display:flex;"><span>    {
+</span></span><span style="display:flex;"><span>        newInputLagFrames <span style="color:#f92672">=</span> <span style="color:#ae81ff">0</span>;
+</span></span><span style="display:flex;"><span>    }
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>    RJ_ASSERT( newInputLagFrames <span style="color:#f92672">&lt;=</span> c_MaxInputLagFrames );
+</span></span><span style="display:flex;"><span>    <span style="color:#66d9ef">return</span> newInputLagFrames;
+</span></span><span style="display:flex;"><span>}
+</span></span></code></pre></div><p>When the local lag setting decreases, the simulation needs to process queued input values immediately. When it increases, the simulation needs to add lag by stalling some number of frames just like it does for frame advantages.</p>
+<p>Similar to predicting the the “start game delay” based on user ping values, we can predict an initial input lag. In the following prediction code, m_logicInterval is the duration of a simulation frame in microseconds (e.g. 16667 for 60fps):</p>
+<div class="highlight"><pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;"><code class="language-cpp" data-lang="cpp"><span style="display:flex;"><span>tU32 worstPingMsecs <span style="color:#f92672">=</span> <span style="color:#ae81ff">0</span>;
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span><span style="color:#66d9ef">for</span> (tU32 i <span style="color:#f92672">=</span> <span style="color:#ae81ff">0</span>; i <span style="color:#f92672">&lt;</span> m_activeGameSettings.m_memberCount; <span style="color:#f92672">++</span>i)
+</span></span><span style="display:flex;"><span>    worstPingMsecs <span style="color:#f92672">=</span> Max(worstPingMsecs, m_members[i].m_localPing);
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>tF32 roundTripLagFrames <span style="color:#f92672">=</span> (tF32)(worstPingMsecs<span style="color:#f92672">*</span>c_Usecs_Per_Msec) <span style="color:#f92672">/</span> (tF32)m_logicInterval;
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>m_inputLagFrames <span style="color:#f92672">=</span> CalcInputLagFrames(<span style="color:#ae81ff">0</span>, <span style="color:#ae81ff">0.5f</span><span style="color:#f92672">*</span>roundTripLagFrames); <span style="color:#75715e">// divides by two to only consider a one way trip
+</span></span></span></code></pre></div><h3 id="network-starvation">Network Starvation</h3>
+<p>If the connection gets <em>really</em> bad or the remote client disconnects, the simulation will need to stop and wait for input. How long it can wait before this point depends on how many frames of restoration it allows. INVERSUS guarantees there to be a backup at least 20 frames old and if it ever hits a point where it hasn’t received remote input for 20 frames, a giant spinner is placed on the screen while it waits for more input or decides a peer has abruptly disconnected.</p>
+<p><img src="/images/rollback-networking-in-inversus/5-Spinner.png" alt="Spinner"></p>
+<h3 id="audio-segregation">Audio Segregation</h3>
+<p>While the visual symptoms of rollback correction can be mostly ignored, the audio symptoms are more obnoxious.</p>
+<p>The naive setup is to manage all sounds outside of the gamestate and have the game just sends fire-and-forget sound requests as necessary. In this world, all sounds play from start to end (no clipping), but when a frame is simulated again due to rolling back, it will cause the sounds to play again. This creates a cacophony in high latency scenarios.</p>
+<p>An alternate setup might ignore all sound requests during the rollback process. This would fix the multiple sound issue, but creates a new issue where any sounds that were a result of input correction (e.g. the remote player pressed the fire button 3 frames ago) are skipped. Everything from the local player sounds great, but sounds are dropping from everyone else.</p>
+<p>Initially, INVERSUS just tracked all game sounds (collision, explosions) separate from non-game sounds (music, menus). The game sounds existed in gamestate and thus had their existence and play cursor times rolled back accordingly. When processing corrected frames due to a rollback, the simulation would advance the audio timers without actually outputting any sound. This clips the end of any sounds which shouldn’t be playing anymore and clips the start from sounds that were not predicted. INVERSUS has a custom audio mixer so this was easy to implement. The mixer looks at what is playing every frame and samples the appropriate bits of audio data. It is oblivious to the restore process wiping the old memory state and just reacts accordingly. If you are using a third party audio library, a similar system could require a more manual approach.</p>
+<p>Surprisingly, the clipped audio waveforms don’t cause <em>too</em> much of an issue in regards to audio quality, but not getting the first few frames of mispredicted remote attacks was unacceptable. Most of the energy happens right at the start of sound effects and the game feels broken without them. To fix this, a third method for playing sounds was added. Previously, only sounds with no relation to the gameplay events (music, menus) would play from the non-gamestate sound scene. By letting short fire-and-forget gameplay sounds also use the non-gamestate sound scene, they never get clipped. Fire-and-forget sounds that trigger from any frames of rollback correction get added to the non-gamestate system and play from the beginning. An identification system is then used to avoid the previously mentioned issue of sounds playing multiple times.</p>
+<p>Every time a gameplay sound is pushed into the non-gamestate sound scene, the sound event and frame number are added to a sound history ring buffer. The ring buffer tracks the most recent 128 events and lets us ignore sound requests if a matching event exists (e.g. it is playing again due to a rollback). For INVERSUS, I just identify sounds with the event name (e.g. “ProjectileHitWall”) and not with any sort of instance identifier. This means that if two separate entities triggered the same sound event on the same frame it would only play once. This ended up being more of a benefit than an issue for me in regards to the soundscape, but may be different in your use case.</p>
+<p>The biggest problem left is that this system won’t stop sounds that were mispredicted to play, but it is a far less pressing problem than the ones that we solved. This problem has such little impact that I ended up shipping without fixing it. In the worst case scenario, you shoot and hit another player triggering an explosion. Both the audio and visual effects start to play. You then learn that the other player moved out of the way or maybe they blocked the shot. Upon correction, the explosion effect will revert state (and likely be unnoticed), but the audio keeps going. Players hear an explosion that never happened. Preferably this would be fixed by the game detecting when sounds in the history were not triggered again during rollback and quickly fading them out.</p>
+<p>To reiterate, these are the three ways audio is played in INVERSUS:</p>
+<ul>
+<li>Global fire-and-forget sounds unrelated to networked gameplay
+<ul>
+<li>These play through the non-gamestate sound scene</li>
+<li>Examples: Highlight menu item, click menu item, music, “Player 1 Wins!”</li>
+</ul>
+</li>
+<li>Global fire-and-forget sounds related to networked gameplay
+<ul>
+<li>These play through the non-gamestate sound scene</li>
+<li>These are tracked in a sound history buffer and the same event can only be started once per simulation frame</li>
+<li>This is the optimal category for gameplay sounds which are not easy to predict</li>
+<li>Examples: Shooting, explosions, impacts, “Multiplier Up!”</li>
+</ul>
+</li>
+<li>Sounds tightly coupled with gameplay state
+<ul>
+<li>These play through the gamestate sound scene</li>
+<li>These sounds can be clipped at the front or back due to rollbacks</li>
+<li>Gameplay logic can communicate with these sounds (adjust volume, terminate loops, etc)</li>
+<li>This is the optimal category for gameplay sounds which are easy to predict or cannot be fire-and-forget</li>
+<li>Examples: Starting looped charging attack, attack fully charged</li>
+</ul>
+</li>
+</ul>
+<h3 id="desync-detection">Desync Detection</h3>
+<p>Optimally the game will remain in perfect synchronization between all clients, but what if there is a bug that causes them to go out of sync? There could even be a hardware issue on one of the clients that causes it to produce a garbage memory read which results in non-determinism. INVERSUS tries to detect these scenarios and automatically terminates the game. This was very useful for detecting bugs during development. I never had issues with the simulation remaining deterministic but I did need to fix a bunch of things with “off by one” errors in the rollback system.</p>
+<p>Detection is performed by checking that all clients are in perfect synchronization of the floating-point player positions every 500 frames. Because we cannot detect synchronization until a frame is no longer based on predicted input, this process was slightly more involved than I expected. For example, it’s possible that a peer sends us data about positions on frame 2500 when we still haven’t seen all of the input past frame 2497. To manage this, I track the most recent validation data from each peer and the most recent data from the local machine. Every frame I check if the local validation data is useable (it was either predicted correctly or was corrected through rollback). If it has just become useable, I send it out to my peers. On all frames in which it is deemed usable, I compare it with any matching peer data received. If I detect a difference, the game is terminated.</p>
+<h3 id="variable-frame-rates">Variable Frame Rates</h3>
+<p>For any of this to work, the game needs to simulate at a consistent frame rate. INVERSUS runs at 60fps which works great on consoles, but on PC you can’t guarantee what refresh rate the game needs to run at. If the refresh rate of the monitor isn’t a clean multiple of the update duration, the user will see stuttery animation as frames are dropped or get rendered twice.</p>
+<p>The variable refresh rate problem can be tackled in numerous ways, but most aren’t great.</p>
+<ul>
+<li>Simulating with a variable update step:
+<ul>
+<li>This is a non-starter for our networked determinism needs, but also creates a whole bunch of other issues you need to deal with in order to create a stable and consistent user experience.</li>
+</ul>
+</li>
+<li>Rendering partial updates:
+<ul>
+<li>These methods all have a common issue where input latency cycles between 0 and 1 frame as the refresh-rate and input-rate phase shift apart.</li>
+<li>Some games will try to interpolate results between the previous frame and the new frame. The worst part about this method is that it will introduce an additional frame of input latency which is unacceptable. It also has issues with displaying discontinuities in motion and requires your game’s simulation to output to a blendable representation which adds cumbersome constraints on the engineer.</li>
+<li>Some games will try to extrapolate subframe motion prior to rendering. The player might now see artifacts like bullets extrapolate through a wall for a frame before exploding. Getting this right creates a bunch of complicated extrapolation code and more annoying dependencies and constraints for the engineer to worry about.</li>
+<li>Another option is to simulate at a faster interval than input is polled for. For example, we could poll input every 16.666 milliseconds (60fps), but simulate every 2.083 milliseconds (480fps). We still have a deterministic output based on the 60hz cadence of networked input, but we also have a much larger set of refresh rates that map to our simulation rate. Also, when the refresh rate doesn’t match perfectly, the visual stutter will be minimized due to a lower time error. This method is somewhat appealing if you can simulate fast enough, but even then it can’t support every potential refresh rate.</li>
+</ul>
+</li>
+</ul>
+<p>INVERSUS solves this (as much as it can be solved) with a partial update approach that takes advantage of the gamestate rollback system. It creates accurate sub-frame extrapolation without any additional complexity added to the game logic or render state. Assuming the game can be told to update at an arbitrary time delta, we can do the following when our refresh-rate is different from our simulation-rate:</p>
+<ol>
+<li>Backup the 60hz current simulation state.</li>
+<li>Tell the sound scene to suppress all audio requests such that nothing from the extrapolated frame can create audio.</li>
+<li>Simulate forward for however much time has passed between the most recent 60hz frame and the real-world render time. This uses input data from the most recent simulation frame.</li>
+<li>Tell the sound scene to stop suppression</li>
+<li>Render the current extrapolated state</li>
+<li>Restore the 60hz simulation state</li>
+</ol>
+<p>Are the results of this perfect? No, but they are sufficient. As with the network prediction, something could happen during extrapolation that doesn’t actually happen and thus gets rolled back. Suppressing all sounds made it work well enough, but it would be possible to also suppress large visual events such as explosions for additional polish.</p>
+<h3 id="debug-inspection">Debug Inspection</h3>
+<p>In order to help debug the networking systems, I used a mix of a simple real-time display and extensive logging.</p>
+<p>The on screen display was mostly useful for tuning parameters to the system. For each connection, it shows the range of values being averaged into the lag and input frame advantage calculations along with information on how much data is being transferred. It also shows how the local input lag is reacting to the current networking conditions.</p>
+<p><img src="/images/rollback-networking-in-inversus/6-NetDebug.png" alt="NetDebug"></p>
+<p>I’d enable detailed network logging when I needed to debug the actual rollback system and determinism. The logging would generate giant output files of the what input was being sent and received, when and why frames were backed up and restored, and what input was used on each frame. If synchronization issues were being detected, I would first increase the detection rate from every 500 frames to every 10 frames making it easier to see exactly when it happened. Then I would enable logging on all clients and generate the debug files. Loading the files up side-by-side, I could find where they diverged. Fortunately, I didn’t have to do this too often because it wasn’t very fun.</p>
+<h2 id="results">Results</h2>
+<p>INVERSUS shipped without any gameplay networking issues and players continue to comment on how great the “netcode” is. With how late and fast it was all added to the game, I think it was a huge success. As I’ve continued to update the game, it has also been the simplest networking architecture I’ve interfaced with. Due to the strong decoupling from game logic, adding fully networked features is trivial. The only real consideration is which audio method should be used for new sounds. The entire system is also about as resistant to online cheating as you can get. Everyone’s results are peer validated and the only way to cheat would be writing a bot for the game that still played by the rules.</p>
+<p>The networking implementation has also been a strong point of validation for the custom tech INVERSUS is built on. By keeping things simple and maintaining full control of memory, the backup and restoration process was straightforward and robust. I suspect this process to be more challenging in a modern commercial engine, but I haven’t personally confirmed it.</p>
+<p>If you’re making a local multiplayer game with short rounds and considering networking, I highly recommend evaluating a rollback style system.</p>
+</div>
+    </article>
+  </main>
+
+      </div>
+      <footer>
+  <hr />
+  
+  <p class="copyright">
+    Copyright © 2024
+    <a href="https://example.org/"><strong>GameDevGems</strong></a>.
+    This work is licensed under the
+    <a href="http://creativecommons.org/licenses/by-sa/4.0/">CC BY-SA 4.0</a> license.
+  </p>
+  <p class="builtWith">
+    Built with
+    <a href="http://www.gohugo.io/">Hugo</a>,
+    using the theme
+    <a href="https://gitlab.com/ian-s-mcb/smigle-hugo-theme">smigle</a>,
+    which was influenced by the theme
+    <a href="https://github.com/sumnerevans/smol">smol</a>.
+  </p>
+</footer>
+
+    </div>
+  </body>
+</html>
